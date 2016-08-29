@@ -1,6 +1,7 @@
 package org.geoserver.security.xauth;
 
 import com.google.common.base.Strings;
+import com.google.common.base.Throwables;
 import org.apache.commons.lang.RandomStringUtils;
 import org.geoserver.platform.GeoServerExtensions;
 import org.geoserver.security.GeoServerRoleConverter;
@@ -30,13 +31,16 @@ import java.util.List;
 import java.util.Set;
 import java.util.SortedSet;
 import java.util.TreeSet;
+import java.util.concurrent.Callable;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public class XAuthFilter extends GeoServerRequestHeaderAuthenticationFilter {
 
   static final Logger LOG = Logging.getLogger(XAuthFilter.class);
-
+  static final String NUM_TRIES = "xauth.retryCount";
+  static final String WAIT_ON_RETRY = "xauth.waitOnRetry";
+  
   List<String> newUserGroups;
   boolean autoProvisionUsers;
 
@@ -70,7 +74,7 @@ public class XAuthFilter extends GeoServerRequestHeaderAuthenticationFilter {
             if (autoProvisionUsers) {
               // add it
               if (ugService.canCreateStore()) {
-                user = createNewUser(username, ugService);
+                user = doWithRetry(() -> createNewUser(username, ugService));
               } else {
                 LOG.warning("Unable to synchronize read-only user group service");
               }
@@ -105,7 +109,6 @@ public class XAuthFilter extends GeoServerRequestHeaderAuthenticationFilter {
       return secMgr.loadUserGroupService(name);
     }
 
-    
     LOG.warning("Unable to determine user group service, configure one on this filter");
     return null;
   }
@@ -175,29 +178,10 @@ public class XAuthFilter extends GeoServerRequestHeaderAuthenticationFilter {
       if (!compare.equal) {
         // synchronize the user group service
         if (roleService.canCreateStore()) {
-          synchronized (this) {
-            GeoServerRoleStore store = roleService.createStore();
-
-            // first add the role if it doesn't exist
-            for (GeoServerRole r : header) {
-              GeoServerRole existing = roleService.getRoleByName(r.getAuthority());
-              if (existing == null) {
-                store.addRole(r); 
-              }
-            }
-            
-            for (GeoServerRole r : compare.remove()) {
-              store.disAssociateRoleFromUser(r, principal);
-            }
-            for (GeoServerRole r : compare.add()) {
-              // TODO: should we assume roles always present in database?
-              //if (store.getRoleByName(r.getAuthority()) == null) {
-              //  store.addRole(r);
-              //}
-              store.associateRoleToUser(r, principal);
-            }
-            store.store();
-          }
+          doWithRetry(() -> {
+            createAndAssociateRoles(principal, header, roleService, compare);
+            return null;
+          });
         } else {
           LOG.warning("Unable to synchronize read-only role service");
         }
@@ -208,6 +192,32 @@ public class XAuthFilter extends GeoServerRequestHeaderAuthenticationFilter {
         new RoleCalculator(roleService).calculateRoles(new GeoServerUser(principal));
     roles.addAll(header);
     return roles;
+  }
+
+  synchronized void createAndAssociateRoles(String principal, Collection<GeoServerRole> header,
+                                            GeoServerRoleService roleService, RoleComparison compare) throws IOException {
+
+    GeoServerRoleStore store = roleService.createStore();
+
+    // first add the role if it doesn't exist
+    for (GeoServerRole r : header) {
+      GeoServerRole existing = roleService.getRoleByName(r.getAuthority());
+      if (existing == null) {
+        store.addRole(r); 
+      }
+    }
+    
+    for (GeoServerRole r : compare.remove()) {
+      store.disAssociateRoleFromUser(r, principal);
+    }
+    for (GeoServerRole r : compare.add()) {
+      // TODO: should we assume roles always present in database?
+      //if (store.getRoleByName(r.getAuthority()) == null) {
+      //  store.addRole(r);
+      //}
+      store.associateRoleToUser(r, principal);
+    }
+    store.store();
   }
 
   GeoServerRoleService findRoleService() throws IOException {
@@ -271,5 +281,32 @@ public class XAuthFilter extends GeoServerRequestHeaderAuthenticationFilter {
   @Override
   public String getCacheKey(HttpServletRequest request) {
     return null;
+  }
+
+  <T> T doWithRetry(Callable<T> task) throws IOException {
+    int tries = Integer.getInteger(NUM_TRIES, 5);
+    long wait = Long.getLong(WAIT_ON_RETRY, 1000);
+
+    Exception error = null;
+    for (int i = 0; i < tries; i++) {
+      try {
+        return task.call();
+      }
+      catch(Exception e) {
+        error = e;
+        LOG.log(Level.WARNING, String.format("error on auto provision, attempt %d/%d", i, tries), e);
+        try {
+          Thread.sleep(wait);
+        } catch (InterruptedException e1) {
+          LOG.log(Level.SEVERE, "retry wait interrupted", e1);
+        }
+      }
+    }
+
+    if (error != null) {
+      Throwables.propagateIfInstanceOf(error, IOException.class);
+    }
+
+    throw new IOException("unable to auto provision", error);
   }
 }
