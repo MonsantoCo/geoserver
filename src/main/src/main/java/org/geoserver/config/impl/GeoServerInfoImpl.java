@@ -454,14 +454,4 @@ public class GeoServerInfoImpl implements GeoServerInfo {
         this.webUIMode = webUIMode;
     }
 
-    @Override
-    public WebUIMode getWebUIMode() {
-        return webUIMode;
-    }
-
-    @Override
-    public void setWebUIMode(WebUIMode webUIMode) {
-        this.webUIMode = webUIMode;
-    }
-
 }
