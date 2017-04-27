@@ -5,10 +5,10 @@
  */
 package org.geoserver.catalog.rest;
 
-import static junit.framework.Assert.assertEquals;
-import static junit.framework.Assert.assertNotNull;
-import static junit.framework.Assert.assertNull;
-import static junit.framework.Assert.assertTrue;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 import static org.custommonkey.xmlunit.XMLAssert.assertXpathEvaluatesTo;
 import static org.custommonkey.xmlunit.XMLAssert.assertXpathExists;
 import static org.junit.Assert.*;
@@ -72,8 +72,16 @@ public class CoverageTest extends CatalogRESTTestSupport {
 
     @Test
     public void testGetAllByCoverageStore() throws Exception {
+        removeStore("gs", "usaWorldImage");
+        String req = "wcs?service=wcs&request=getcoverage&version=1.1.1&identifier=gs:usa" +
+            "&boundingbox=-100,30,-80,44,EPSG:4326&format=image/tiff" +
+            "&gridbasecrs=EPSG:4326&store=true";
+
+        Document dom = getAsDOM( req );
+        assertEquals( "ows:ExceptionReport", dom.getDocumentElement().getNodeName());
+
         addCoverageStore(true);
-        Document dom = getAsDOM( "/rest/workspaces/gs/coveragestores/usaWorldImage/coverages.xml");
+        dom = getAsDOM( "/rest/workspaces/gs/coveragestores/usaWorldImage/coverages.xml");
         assertEquals( 1, dom.getElementsByTagName( "coverage").getLength() );
         assertXpathEvaluatesTo( "1", "count(//coverage/name[text()='usa'])", dom );
     }
@@ -290,6 +298,76 @@ public class CoverageTest extends CatalogRESTTestSupport {
     }
 
     @Test
+    public void testPostNewAsXMLWithNativeCoverageName() throws Exception {
+        removeStore("gs", "usaWorldImage");
+        String req = "wcs?service=wcs&request=getcoverage&version=1.1.1&identifier=gs:differentName" +
+            "&boundingbox=-100,30,-80,44,EPSG:4326&format=image/tiff" +
+            "&gridbasecrs=EPSG:4326&store=true";
+
+        Document dom = getAsDOM( req );
+        assertEquals( "ows:ExceptionReport", dom.getDocumentElement().getNodeName());
+
+        addCoverageStore(false);
+        dom = getAsDOM( "/rest/workspaces/gs/coveragestores/usaWorldImage/coverages.xml");
+        assertEquals( 0, dom.getElementsByTagName( "coverage").getLength() );
+
+        String xml =
+            "<coverage>" +
+                "<name>differentName</name>"+
+                "<nativeCoverageName>usa</nativeCoverageName>"+
+              "</coverage>";
+        MockHttpServletResponse response =
+            postAsServletResponse( "/rest/workspaces/gs/coveragestores/usaWorldImage/coverages/", xml, "text/xml");
+
+        assertEquals( 201, response.getStatus() );
+        assertNotNull( response.getHeader( "Location") );
+        assertTrue( response.getHeader("Location").endsWith( "/workspaces/gs/coveragestores/usaWorldImage/coverages/differentName" ) );
+
+        dom = getAsDOM( req );
+        assertEquals( "wcs:Coverages", dom.getDocumentElement().getNodeName() );
+
+        dom = getAsDOM("/rest/workspaces/gs/coveragestores/usaWorldImage/coverages/differentName.xml");
+        assertXpathEvaluatesTo("differentName", "/coverage/name", dom);
+        assertXpathEvaluatesTo("differentName", "/coverage/title", dom);
+        assertXpathEvaluatesTo("usa", "/coverage/nativeCoverageName", dom);
+    }
+
+    @Test
+    public void testPostNewAsXMLWithNativeNameFallback() throws Exception {
+        removeStore("gs", "usaWorldImage");
+        String req = "wcs?service=wcs&request=getcoverage&version=1.1.1&identifier=gs:differentName" +
+            "&boundingbox=-100,30,-80,44,EPSG:4326&format=image/tiff" +
+            "&gridbasecrs=EPSG:4326&store=true";
+
+        Document dom = getAsDOM( req );
+        assertEquals( "ows:ExceptionReport", dom.getDocumentElement().getNodeName());
+
+        addCoverageStore(false);
+        dom = getAsDOM( "/rest/workspaces/gs/coveragestores/usaWorldImage/coverages.xml");
+        assertEquals( 0, dom.getElementsByTagName( "coverage").getLength() );
+
+        String xml =
+            "<coverage>" +
+                "<name>differentName</name>"+
+                "<nativeName>usa</nativeName>"+
+              "</coverage>";
+        MockHttpServletResponse response =
+            postAsServletResponse( "/rest/workspaces/gs/coveragestores/usaWorldImage/coverages/", xml, "text/xml");
+
+        assertEquals( 201, response.getStatus() );
+        assertNotNull( response.getHeader( "Location") );
+        assertTrue( response.getHeader("Location").endsWith( "/workspaces/gs/coveragestores/usaWorldImage/coverages/differentName" ) );
+
+        dom = getAsDOM( req );
+        assertEquals( "wcs:Coverages", dom.getDocumentElement().getNodeName() );
+
+        dom = getAsDOM("/rest/workspaces/gs/coveragestores/usaWorldImage/coverages/differentName.xml");
+        assertXpathEvaluatesTo("differentName", "/coverage/name", dom);
+        assertXpathEvaluatesTo("differentName", "/coverage/title", dom);
+        assertXpathEvaluatesTo("usa", "/coverage/nativeCoverageName", dom);
+    }
+
+    @Test
     public void testPutWithCalculation() throws Exception {
         String path = "/rest/workspaces/wcs/coveragestores/DEM/coverages/DEM.xml";
         String clearLatLonBoundingBox =
@@ -324,7 +402,7 @@ public class CoverageTest extends CatalogRESTTestSupport {
                 response.getStatus());
         dom = getAsDOM(path);
         print(dom);
-        assertXpathExists("/coverage/latLonBoundingBox/minx[text()!='0.0']",
+        assertXpathExists("/coverage/nativeBoundingBox/minx[text()!='0.0']",
                 dom);
     }
 
@@ -390,6 +468,25 @@ public class CoverageTest extends CatalogRESTTestSupport {
         
         CoverageInfo c = catalog.getCoverageByName( "wcs", "BlueMarble");
         assertEquals( "new title", c.getTitle() );
+    }
+    @Test
+    public void testPutNonDestructive() throws Exception {
+        CoverageInfo c = catalog.getCoverageByName( "wcs", "BlueMarble");
+        
+        assertTrue(c.isEnabled());
+        boolean isAdvertised = c.isAdvertised();
+        
+        String xml = 
+          "<coverage>" + 
+            "<title>new title</title>" +  
+          "</coverage>";
+        MockHttpServletResponse response = 
+            putAsServletResponse("/rest/workspaces/wcs/coveragestores/BlueMarble/coverages/BlueMarble", xml, "text/xml");
+        assertEquals( 200, response.getStatus() );
+        
+        c = catalog.getCoverageByName( "wcs", "BlueMarble");
+        assertTrue(c.isEnabled());
+        assertEquals(isAdvertised, c.isAdvertised());
     }
 
     @Test

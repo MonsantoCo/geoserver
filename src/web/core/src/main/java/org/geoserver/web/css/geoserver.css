@@ -299,6 +299,9 @@ th.selection {
 	width: 1%; /* use as few space as possible */
 }
 
+.alternating-rows tr:nth-child(even) {
+	background: #e2efcd;
+}
 /*-----------------------
 Forms
 -----------------------*/
@@ -1069,6 +1072,11 @@ border-width: 0 0 1px;
 height: 2.1em;
 margin: 1.5em 0 2.5em;
 }
+
+.tab-row-compact {
+margin: 1.5em 0 1em;
+}
+
 
 .tab-row ul {
 list-style-type: none;

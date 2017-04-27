@@ -162,6 +162,7 @@
             <option value="image/png8">PNG 8bit</option>
             <option value="image/gif">GIF</option>
             <option id="jpeg" value="image/jpeg">JPEG</option>
+            <option id="jpeg-png" value="image/vnd.jpeg-png">JPEG-PNG</option>
           </select>
         </li>
         <li>
@@ -277,7 +278,8 @@
       var projection = new ol.proj.Projection({
           code: '${request.SRS?js_string}',
           units: '${units?js_string}',
-          axisOrientation: 'neu'
+          axisOrientation: 'neu',
+          global: ${global}
       });
       var map = new ol.Map({
         controls: ol.control.defaults({

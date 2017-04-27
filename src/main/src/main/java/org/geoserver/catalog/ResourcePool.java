@@ -20,6 +20,8 @@ import java.io.OutputStreamWriter;
 import java.io.Serializable;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -29,6 +31,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Map.Entry;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -42,6 +45,7 @@ import javax.measure.unit.SI;
 import javax.measure.unit.Unit;
 
 import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang.SerializationUtils;
 import org.eclipse.xsd.XSDElementDeclaration;
 import org.eclipse.xsd.XSDParticle;
 import org.eclipse.xsd.XSDSchema;
@@ -52,16 +56,19 @@ import org.geoserver.catalog.event.CatalogModifyEvent;
 import org.geoserver.catalog.event.CatalogPostModifyEvent;
 import org.geoserver.catalog.event.CatalogRemoveEvent;
 import org.geoserver.catalog.impl.ModificationProxy;
+import org.geoserver.catalog.impl.StoreInfoImpl;
 import org.geoserver.config.GeoServerDataDirectory;
 import org.geoserver.data.util.CoverageStoreUtils;
 import org.geoserver.data.util.CoverageUtils;
 import org.geoserver.feature.retype.RetypingFeatureSource;
+import org.geoserver.platform.GeoServerEnvironment;
 import org.geoserver.platform.GeoServerExtensions;
 import org.geoserver.platform.GeoServerResourceLoader;
 import org.geoserver.platform.ServiceException;
 import org.geoserver.platform.resource.Resource;
 import org.geoserver.platform.resource.ResourceListener;
 import org.geoserver.platform.resource.ResourceNotification;
+import org.geoserver.util.EntityResolverProvider;
 import org.geotools.coverage.grid.GridCoverage2D;
 import org.geotools.coverage.grid.io.AbstractGridFormat;
 import org.geotools.coverage.grid.io.GridCoverage2DReader;
@@ -85,6 +92,7 @@ import org.geotools.data.store.ContentDataStore;
 import org.geotools.data.store.ContentFeatureSource;
 import org.geotools.data.store.ContentState;
 import org.geotools.data.wms.WebMapServer;
+import org.geotools.data.wms.xml.WMSSchema;
 import org.geotools.factory.Hints;
 import org.geotools.feature.AttributeTypeBuilder;
 import org.geotools.feature.FeatureTypes;
@@ -97,8 +105,12 @@ import org.geotools.measure.Measure;
 import org.geotools.referencing.CRS;
 import org.geotools.styling.Style;
 import org.geotools.util.SoftValueHashMap;
+import org.geotools.util.Utilities;
 import org.geotools.util.logging.Logging;
+import org.geotools.xml.DocumentFactory;
 import org.geotools.xml.Schemas;
+import org.geotools.xml.XMLHandlerHints;
+import org.geotools.xml.handlers.DocumentHandler;
 import org.opengis.coverage.grid.GridCoverage;
 import org.opengis.coverage.grid.GridCoverageReader;
 import org.opengis.feature.Feature;
@@ -118,6 +130,7 @@ import org.opengis.referencing.operation.TransformException;
 import org.springframework.context.ApplicationContext;
 import org.vfny.geoserver.global.GeoServerFeatureLocking;
 import org.vfny.geoserver.util.DataStoreUtils;
+import org.xml.sax.EntityResolver;
 
 /**
  * Provides access to resources such as datastores, coverage readers, and 
@@ -195,13 +208,7 @@ public class ResourcePool {
     List<Listener> listeners;
     ThreadPoolExecutor coverageExecutor;
     CatalogRepository repository;
-
-    /**
-     * Creates a new instance of the resource pool.
-     */
-    public static ResourcePool create(Catalog catalog) {
-        return create(catalog, null);
-    }
+    EntityResolverProvider entityResolverProvider;
 
     /**
      * Creates a new instance of the resource pool explicitly supplying the application 
@@ -439,6 +446,29 @@ public class ResourcePool {
     }
     
     /**
+     * Sets the entity resolver provider injected in the code doing XML parsing
+     * @param entityResolverProvider
+     */
+    public void setEntityResolverProvider(EntityResolverProvider entityResolverProvider) {
+        this.entityResolverProvider = entityResolverProvider;
+    }
+    
+    /**
+     * Returns the entity resolver provider injected in the code doing XML parsing
+     * @return
+     */
+    public EntityResolverProvider getEntityResolverProvider() {
+        return entityResolverProvider;
+    }
+
+    /**
+     * Creates a new instance of the resource pool.
+     */
+    public static ResourcePool create(Catalog catalog) {
+        return create(catalog, null);
+    }
+    
+    /**
      * Returns a {@link CoordinateReferenceSystem} object based on its identifier
      * caching the result.
      * <p>
@@ -495,13 +525,15 @@ public class ResourcePool {
      */
     public DataAccessFactory getDataStoreFactory( DataStoreInfo info ) throws IOException {
         DataAccessFactory factory = null;
-    
+        
+        DataStoreInfo expandedStore = clone(info, true);
+        
         if ( info.getType() != null ) {
-            factory = DataStoreUtils.aquireFactory( info.getType() );    
+            factory = DataStoreUtils.aquireFactory( expandedStore.getType() );    
         }
-    
-        if ( factory == null && info.getConnectionParameters() != null ) {
-            Map<String, Serializable> params = getParams( info.getConnectionParameters(), catalog.getResourceLoader() );
+
+        if ( factory == null && expandedStore.getConnectionParameters() != null ) {
+            Map<String, Serializable> params = getParams( expandedStore.getConnectionParameters(), catalog.getResourceLoader() );
             factory = DataStoreUtils.aquireFactory( params);    
         }
    
@@ -519,6 +551,9 @@ public class ResourcePool {
      */
     @SuppressWarnings({ "rawtypes", "unchecked" })
     public DataAccess<? extends FeatureType, ? extends Feature> getDataStore( DataStoreInfo info ) throws IOException {
+        
+        DataStoreInfo expandedStore = clone(info, true);
+        
         DataAccess<? extends FeatureType, ? extends Feature> dataStore = null;
         try {
             String id = info.getId();
@@ -528,7 +563,7 @@ public class ResourcePool {
                     dataStore = dataStoreCache.get( id );
                     if ( dataStore == null ) {
                         //create data store
-                        Map<String, Serializable> connectionParameters = info.getConnectionParameters();
+                        Map<String, Serializable> connectionParameters = expandedStore.getConnectionParameters();
                         
                         // call this method to execute the hack which recognizes 
                         // urls which are relative to the data directory
@@ -583,6 +618,19 @@ public class ResourcePool {
                             for ( Param p : params ) {
                                 if(Repository.class.equals(p.getType())) {
                                     connectionParameters.put(p.getName(), repository);
+                                }
+                            }
+                        }
+                        
+                        // see if the store has a entity resolver param, if so, pass it down
+                        EntityResolver resolver = getEntityResolver();
+                        if(resolver != null && params != null) {
+                            for ( Param p : params ) {
+                                if(EntityResolver.class.equals(p.getType())) {
+                                    if(!(resolver instanceof Serializable)) {
+                                        resolver = new SerializableEntityResolver(resolver);
+                                    }
+                                    connectionParameters.put(p.getName(), (Serializable) resolver);
                                 }
                             }
                         }
@@ -655,9 +703,15 @@ public class ResourcePool {
         @SuppressWarnings("unchecked")
         Map<K,V> params = Collections.synchronizedMap(new HashMap<K,V>(m));
         
+        final GeoServerEnvironment gsEnvironment = GeoServerExtensions.bean(GeoServerEnvironment.class);
+        
         for (Entry<K,V> entry : params.entrySet()) {
             String key = (String) entry.getKey();
             Object value = entry.getValue();
+            
+            if (gsEnvironment != null && GeoServerEnvironment.ALLOW_ENV_PARAMETRIZATION) {
+                value = gsEnvironment.resolveValue(value);
+            }
 
             //TODO: this code is a pretty big hack, using the name to 
             // determine if the key is a url, could be named something else
@@ -1382,6 +1436,8 @@ public class ResourcePool {
     private GridCoverageReader getGridCoverageReader(CoverageStoreInfo info, CoverageInfo coverageInfo, String coverageName, Hints hints) 
         throws IOException {
         
+        CoverageStoreInfo expandedStore = clone(info, true);
+        
         final AbstractGridFormat gridFormat = info.getFormat();
         if(gridFormat == null) {
             throw new IOException("Could not find the raster plugin for format " + info.getType());
@@ -1430,17 +1486,13 @@ public class ResourcePool {
                     // Getting coverage reader using the format and the real path.
                     //
                     // /////////////////////////////////////////////////////////
-                    final String url = info.getURL();
-                    GeoServerResourceLoader loader = catalog.getResourceLoader();
-                    final File obj = loader.url(url);
-
-                    // In case no File is returned, provide the original String url
-                    final Object input = obj != null ? obj : url;  
+                    final String urlString = expandedStore.getURL();
+                    Object readObject = getObjectToRead(urlString);
 
                     // readers might change the provided hints, pass down a defensive copy
-                    reader = gridFormat.getReader(input, new Hints(hints));
+                    reader = gridFormat.getReader(readObject, new Hints(hints));
                     if(reader == null) {
-                        throw new IOException("Failed to create reader from " + url + " and hints " + hints);
+                        throw new IOException("Failed to create reader from " + urlString + " and hints " + hints);
                     }
                     if(key != null) {
                         if(hints != null) {
@@ -1453,11 +1505,15 @@ public class ResourcePool {
             }
         }
 
+        if(coverageInfo == null && coverageName != null) {
+            coverageInfo = getCoverageInfo(coverageName, info);
+        }
+        
         if (coverageInfo != null) {
             MetadataMap metadata = coverageInfo.getMetadata();
             if (metadata != null && metadata.containsKey(CoverageView.COVERAGE_VIEW)) {
                 CoverageView coverageView = (CoverageView) metadata.get(CoverageView.COVERAGE_VIEW);
-                return CoverageViewReader.wrap((GridCoverage2DReader) reader, coverageView, coverageInfo, hints);
+                reader = CoverageViewReader.wrap((GridCoverage2DReader) reader, coverageView, coverageInfo, hints);
             }
         }
 
@@ -1467,7 +1523,7 @@ public class ResourcePool {
             // GeoServer does not need to be updated to the multicoverage stuff
             // (we might want to introduce a hint later for code that really wants to get the
             // multi-coverage reader)
-            return CoverageDimensionCustomizerReader.wrap((GridCoverage2DReader) reader, coverageName, info);
+            return CoverageDimensionCustomizerReader.wrap((GridCoverage2DReader) reader, coverageName, coverageInfo);
         } else {
             // In order to deal with Bands customization, we need to get a CoverageInfo.
             // Therefore we won't wrap the reader into a CoverageDimensionCustomizerReader in case 
@@ -1477,7 +1533,7 @@ public class ResourcePool {
             // that case so returning the simple reader.
             final int numCoverages = ((GridCoverage2DReader) reader).getGridCoverageCount();
             if (numCoverages == 1) {
-                return CoverageDimensionCustomizerReader.wrap((GridCoverage2DReader) reader, null, info);
+                return CoverageDimensionCustomizerReader.wrap((GridCoverage2DReader) reader, null, coverageInfo);
             }
             // Avoid dimensions wrapping since we have a multi-coverage reader 
             // but no coveragename have been specified
@@ -1485,7 +1541,42 @@ public class ResourcePool {
 
         }
     }
-    
+
+    /**
+     * Attempted to convert the URL-ish string to a file object, otherwise just returns the string
+     * itself
+     *
+     * @param urlString the url string to parse, which may actually be a path
+     * @return an object appropriate for passing to a grid coverage reader
+     */
+    private Object getObjectToRead(String urlString) {
+        //Check to see if our "url" points to a file or not, otherwise we use the string
+        //itself for reading
+        Object readObject = urlString;
+        boolean isFile = false;
+        URI uri;
+        try {
+            uri = new URI(urlString);
+            if (uri.getScheme() == null || "file".equalsIgnoreCase(uri.getScheme())) {
+                isFile = true;
+            }
+        } catch (URISyntaxException e) {
+            LOGGER.warning("Unable to convert coverage URL to a URI, attempting to use "
+                + "it as a path");
+            LOGGER.log(Level.FINEST, "Can't convert URL string to URI, this may be "
+                + "fine if the URL is actually a path", e);
+        }
+
+        if (isFile) {
+            GeoServerResourceLoader loader = catalog.getResourceLoader();
+            final File readerFile = loader.url(urlString);
+            if (readerFile != null) {
+                readObject = readerFile;
+            }
+        }
+        return readObject;
+    }
+
     /**
      * Clears any cached readers for the coverage.
      */
@@ -1640,18 +1731,35 @@ public class ResourcePool {
      * @throws IOException
      */
     public WebMapServer getWebMapServer(WMSStoreInfo info) throws IOException {
+        
+        WMSStoreInfo expandedStore = clone(info, true);
+        
         try {
+            EntityResolver entityResolver = getEntityResolver();
+            
             String id = info.getId();
             WebMapServer wms = wmsCache.get(id);
+            // if we have a hit but the resolver has been changed, clean and build again
+            if(wms != null && wms.getHints() != null && !Objects.equals(wms.getHints().get(XMLHandlerHints.ENTITY_RESOLVER), entityResolver)) {
+                wmsCache.remove(id);
+                wms = null;
+            }
             if (wms == null) {
                 synchronized (wmsCache) {
                     wms = wmsCache.get(id);
                     if (wms == null) {
-                        HTTPClient client = getHTTPClient(info);
-                        String capabilitiesURL = info.getCapabilitiesURL();
+                        HTTPClient client = getHTTPClient(expandedStore);
+                        String capabilitiesURL = expandedStore.getCapabilitiesURL();
                         URL serverURL = new URL(capabilitiesURL);
-                        wms = new WebMapServer(serverURL, client);
+                        Map<String, Object> hints = new HashMap<>();
+                        hints.put(DocumentHandler.DEFAULT_NAMESPACE_HINT_KEY, WMSSchema.getInstance());
+                        hints.put(DocumentFactory.VALIDATION_HINT, Boolean.FALSE);
+                        if(entityResolver != null) {
+                            hints.put(XMLHandlerHints.ENTITY_RESOLVER, entityResolver);
+                        }
                         
+                        wms = new WebMapServer(serverURL, client, hints);
+
                         wmsCache.put(id, wms);
                     }
                 }
@@ -1663,6 +1771,18 @@ public class ResourcePool {
         } catch (Exception e) {
             throw (IOException) new IOException().initCause(e);
         }
+    }
+
+    /**
+     * Returns the entity resolver from the {@link EntityResolverProvider}, or null if none is configured
+     * @return
+     */
+    public EntityResolver getEntityResolver() {
+        EntityResolver entityResolver = null;
+        if(entityResolverProvider != null) {
+             entityResolver = entityResolverProvider.getEntityResolver();
+        }
+        return entityResolver;
     }
     
     private HTTPClient getHTTPClient(WMSStoreInfo info) {
@@ -2323,5 +2443,176 @@ public class ResourcePool {
         ContentFeatureSource featureSource;
         featureSource = contentDataStore.getFeatureSource(nativeName);
         featureSource.getState().flush();
+    }
+    
+    public DataStoreInfo clone(final DataStoreInfo source, boolean allowEnvParametrization) {
+        DataStoreInfo target;
+        try {
+            target = (DataStoreInfo) SerializationUtils.clone(source);
+            if (target instanceof StoreInfoImpl && target.getCatalog() == null) {
+                ((StoreInfoImpl)target).setCatalog(catalog);
+            }
+        } catch (Exception e) {
+            target = catalog.getFactory().createDataStore();
+            target.setEnabled(source.isEnabled());
+            target.setName(source.getName());
+            target.setDescription(source.getDescription());
+            target.setWorkspace(source.getWorkspace());
+            target.setType(source.getType());
+        }
+        
+        // Resolve GeoServer Environment placeholders
+        final GeoServerEnvironment gsEnvironment = GeoServerExtensions.bean(GeoServerEnvironment.class);
+
+        if (source.getConnectionParameters() != null && !source.getConnectionParameters().isEmpty()) {
+            target.getConnectionParameters().clear();
+        
+            if (!allowEnvParametrization) {
+                target.getConnectionParameters().putAll(source.getConnectionParameters());
+            } else {
+                if(source != null && source.getConnectionParameters() != null) {
+                    for (Entry<String, Serializable> param : source.getConnectionParameters().entrySet()) {
+                        String key = param.getKey();
+                        Object value = param.getValue();
+
+                        if (gsEnvironment != null && GeoServerEnvironment.ALLOW_ENV_PARAMETRIZATION) {
+                            value = gsEnvironment.resolveValue(value);
+                        }
+
+                        target.getConnectionParameters().put(key, (Serializable) value);
+                    }
+                }
+            }
+        }
+        
+        return target;
+    }
+
+    public CoverageStoreInfo clone(final CoverageStoreInfo source, boolean allowEnvParametrization) {
+        CoverageStoreInfo target;
+        try {
+            target = (CoverageStoreInfo) SerializationUtils.clone(source);
+            if (target instanceof StoreInfoImpl && target.getCatalog() == null) {
+                ((StoreInfoImpl)target).setCatalog(catalog);
+            }
+        } catch (Exception e) {
+            target = catalog.getFactory().createCoverageStore();
+            target.setDescription(source.getDescription());
+            target.setEnabled(source.isEnabled());
+            target.setName(source.getName());
+            target.setType(source.getType());
+            target.setWorkspace(source.getWorkspace());
+        }
+
+        // Resolve GeoServer Environment placeholders
+        final GeoServerEnvironment gsEnvironment = GeoServerExtensions.bean(GeoServerEnvironment.class);
+
+        if (gsEnvironment != null && GeoServerEnvironment.ALLOW_ENV_PARAMETRIZATION) {
+            target.setURL((String) gsEnvironment.resolveValue(source.getURL()));
+        } else {
+            target.setURL(source.getURL());
+        }
+
+        if (source.getConnectionParameters() != null && !source.getConnectionParameters().isEmpty()) {
+        
+            if (!allowEnvParametrization) {
+                target.setURL(source.getURL());
+                target.getConnectionParameters().putAll(source.getConnectionParameters());
+            } else {
+                for (Entry<String, Serializable> param : source.getConnectionParameters().entrySet()) {
+                    String key = param.getKey();
+                    Object value = param.getValue();
+
+                    if (gsEnvironment != null && GeoServerEnvironment.ALLOW_ENV_PARAMETRIZATION) {
+                        value = gsEnvironment.resolveValue(value);
+                    }
+
+                    target.getConnectionParameters().put(key, (Serializable) value);
+                }
+            }
+        }
+        
+        return target;
+    }
+    
+    public WMSStoreInfo clone(final WMSStoreInfo source, boolean allowEnvParametrization) {
+        WMSStoreInfo target;
+        try {
+            target = (WMSStoreInfo) SerializationUtils.clone(source);
+            if (target instanceof StoreInfoImpl && target.getCatalog() == null) {
+                ((StoreInfoImpl)target).setCatalog(catalog);
+            }
+        } catch (Exception e) {
+            target = catalog.getFactory().createWebMapServer();
+            target.setDescription(source.getDescription());
+            target.setEnabled(source.isEnabled());
+            target.setName(source.getName());
+            target.setType(source.getType());
+            target.setWorkspace(source.getWorkspace());            
+        }
+        
+        setConnectionParameters(source, target);            
+
+        if (allowEnvParametrization) {
+            // Resolve GeoServer Environment placeholders
+            final GeoServerEnvironment gsEnvironment = GeoServerExtensions.bean(GeoServerEnvironment.class);
+            
+            if (gsEnvironment != null && GeoServerEnvironment.ALLOW_ENV_PARAMETRIZATION) {
+                target.setCapabilitiesURL((String) gsEnvironment.resolveValue(source.getCapabilitiesURL()));
+                target.setUsername((String) gsEnvironment.resolveValue(source.getUsername()));
+                target.setPassword((String) gsEnvironment.resolveValue(source.getPassword()));
+            }
+        }
+        
+        return target;
+    }
+    
+    /**
+     * @param source
+     * @param target
+     */
+    private void setConnectionParameters(final WMSStoreInfo source, WMSStoreInfo target) {
+        target.setCapabilitiesURL(source.getCapabilitiesURL());
+        target.setUsername(source.getUsername());
+        target.setPassword(source.getPassword());
+        target.setUseConnectionPooling(source.isUseConnectionPooling());
+        target.setMaxConnections(source.getMaxConnections());
+        target.setConnectTimeout(source.getConnectTimeout());
+        target.setReadTimeout(source.getReadTimeout());
+    }
+
+    /**
+     * Retrieve the proper {@link CoverageInfo} object from the specified {@link CoverageStoreInfo} 
+     * using the specified coverageName (which may be the native one in some cases).
+     * In case of null coverageName being specified, we assume we are dealing with a 
+     * single coverageStore <-> single coverage relation so we will take the first coverage available
+     * on that store.
+     * 
+     * @param storeInfo the storeInfo to be used to access the catalog
+     *
+     */
+    static CoverageInfo getCoverageInfo(String coverageName, CoverageStoreInfo storeInfo) {
+        Utilities.ensureNonNull("storeInfo", storeInfo);
+        final Catalog catalog = storeInfo.getCatalog();
+        CoverageInfo info = null;
+        if (coverageName != null) {
+            info = catalog.getCoverageByName(coverageName);
+        }
+        if (info == null) {
+            final List<CoverageInfo> coverages = catalog.getCoveragesByStore(storeInfo);
+            if (coverageName != null) {
+                for (CoverageInfo coverage: coverages) {
+                    if (coverage.getNativeName().equalsIgnoreCase(coverageName)) {
+                        info = coverage;
+                        break;
+                    }
+                }
+            }
+            if (info == null && coverages != null && coverages.size() == 1) {
+                // Last resort
+                info = coverages.get(0);
+            }
+        }
+        return info;
     }
 }

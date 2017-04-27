@@ -10,6 +10,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -24,11 +27,18 @@ import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import com.thoughtworks.xstream.io.json.JettisonStaxWriter;
+import com.thoughtworks.xstream.io.xml.StaxWriter;
 import org.apache.commons.collections.MultiHashMap;
+import org.codehaus.jettison.json.JSONArray;
+import org.codehaus.jettison.json.JSONObject;
+import org.codehaus.jettison.mapped.MappedXMLStreamWriter;
+import org.codehaus.jettison.util.FastStack;
 import org.geoserver.catalog.AttributeTypeInfo;
 import org.geoserver.catalog.AttributionInfo;
 import org.geoserver.catalog.AuthorityURLInfo;
 import org.geoserver.catalog.Catalog;
+import org.geoserver.catalog.CatalogInfo;
 import org.geoserver.catalog.CoverageDimensionInfo;
 import org.geoserver.catalog.CoverageInfo;
 import org.geoserver.catalog.CoverageStoreInfo;
@@ -167,6 +177,12 @@ public class XStreamPersister {
      * Callback interface or xstream persister.
      */
     public static class Callback {
+        /** Return the CatalogInfo object being modified by the current request */
+        protected CatalogInfo getCatalogObject() { return null; }
+        /** Return the ServiceInfo object being modified by the current request */
+        protected ServiceInfo getServiceObject() { return null; }
+        /** Return the class of the object being acted upon by the current request */
+        protected Class<? extends Info> getObjectClass() { return null; }
         protected void postEncodeWorkspace( WorkspaceInfo ws, HierarchicalStreamWriter writer, MarshallingContext context ) {
         }
         
@@ -386,6 +402,7 @@ public class XStreamPersister {
         xs.registerLocalConverter(impl(StoreInfo.class), "workspace", new ReferenceConverter(WorkspaceInfo.class));
         xs.registerLocalConverter(impl(StoreInfo.class), "connectionParameters", new BreifMapConverter() );
         xs.registerLocalConverter(impl(StoreInfo.class), "metadata", new MetadataMapConverter());
+        xs.registerLocalConverter(impl(WMSStoreInfo.class), "password", new EncryptedFieldConverter());
         
         // StyleInfo
         xs.omitField(impl(StyleInfo.class), "catalog");
@@ -439,6 +456,7 @@ public class XStreamPersister {
         xs.registerLocalConverter( GeneralEnvelope.class, "crs", new SRSConverter() );
         
         // ServiceInfo
+        xs.registerConverter(new ServiceInfoConverter());
         xs.omitField( impl(ServiceInfo.class), "geoServer" );
 
         // Converters
@@ -1153,8 +1171,28 @@ public class XStreamPersister {
                     String typeName = cam.serializedClass( theClass );
                     writer.addAttribute("type", typeName);
                 }
-                
                 context.convertAnother( item, new ReferenceConverter( clazz ) );
+            } else if (writer instanceof JettisonStaxWriter) {
+                /*
+                 * GEOS-7771 / GEOS-7873
+                 * Workaround for an array serialization bug in jettison 1.0.1
+                 * Can be removed when we upgrade to jettison 1.2
+                 */
+                writer.setValue("null");
+                try {
+                    Field outField = StaxWriter.class.getDeclaredField("out");
+                    Field nodesField = MappedXMLStreamWriter.class.getDeclaredField("nodes");
+                    outField.setAccessible(true);
+                    nodesField.setAccessible(true);
+                    FastStack nodes = (FastStack) nodesField.get(outField.get(writer.underlyingWriter()));
+                    if (nodes.peek() instanceof JSONArray) {
+                        nodes.pop();
+                    }
+                } catch (IllegalAccessException e) {
+                    e.printStackTrace();
+                } catch (NoSuchFieldException e) {
+                    e.printStackTrace();
+                }
             }
             writer.endNode();
         }
@@ -1507,9 +1545,44 @@ public class XStreamPersister {
         }
     }
     /**
+     * Converter for all {@link CatalogInfo} resources. Obtains the appropriate catalog object in 
+     * {@link #instantiateNewInstance(HierarchicalStreamReader, UnmarshallingContext)} prior to 
+     * reading in the XStream request, so that primitive objects are appropriately initialized.
+     * 
+     * Supported implementations of {@link AbstractCatalogResource} must implement 
+     * {@link XStreamPersister.Callback.getCatalogObject()} and 
+     * {@link XStreamPersister.Callback.getObjectClass()} when providing an instance of 
+     * {@link XStreamPersister.Callback} to {@link XStreamPersister} in 
+     * {@link AbstractCatalogResource.configurePersister(XStreamPersister, DataFormat)}
+     */
+    protected class AbstractCatalogInfoConverter extends AbstractReflectionConverter {
+        public AbstractCatalogInfoConverter(Class clazz) {
+            super(clazz);
+        }
+        private <T> void unsafeCopy(Object source, Object target, Class<T> clazz) {
+            OwsUtils.copy((T)source, (T)target, clazz);
+        }
+        @Override
+        protected Object instantiateNewInstance(HierarchicalStreamReader reader,
+                UnmarshallingContext context) {
+            Object emptyObject = super.instantiateNewInstance(reader, context);
+            //Acquire the current CatalogInfo being acted upon object before unmarshaling the Xstream
+            Object catalogObject = callback.getCatalogObject();
+            
+            if (catalogObject != null) {
+                Class i = callback.getObjectClass();
+                
+                if (i != null) {
+                    unsafeCopy(catalogObject, emptyObject, i);
+                }
+            }
+            return emptyObject;
+        }
+    }
+    /**
      * Converter for {@link DataStoreInfo}, {@link CoverageStoreInfo}, and {@link WMSStoreInfo}
      */
-    class StoreInfoConverter extends AbstractReflectionConverter {
+    class StoreInfoConverter extends AbstractCatalogInfoConverter {
 
         public StoreInfoConverter() {
             super(StoreInfo.class);
@@ -1545,7 +1618,6 @@ public class XStreamPersister {
                         + (store == null ? "null" : store.getClass().getName()));
             }
         }
-        
         @Override
         public Object doUnmarshal(Object result,
                 HierarchicalStreamReader reader, UnmarshallingContext context) {
@@ -1714,7 +1786,7 @@ public class XStreamPersister {
     /**
      * Base converter for handling resources.
      */
-    class ResourceInfoConverter extends AbstractReflectionConverter {
+    class ResourceInfoConverter extends AbstractCatalogInfoConverter {
         
         public ResourceInfoConverter() {
             this(ResourceInfo.class);
@@ -1745,7 +1817,6 @@ public class XStreamPersister {
         public FeatureTypeInfoConverter() {
             super(FeatureTypeInfo.class);
         }
-        
         @Override
         protected void postDoMarshal(Object result,
                 HierarchicalStreamWriter writer, MarshallingContext context) {
@@ -1784,7 +1855,7 @@ public class XStreamPersister {
     /**
      * Converter for layers.
      */
-    class LayerInfoConverter extends AbstractReflectionConverter {
+    class LayerInfoConverter extends AbstractCatalogInfoConverter {
 
         public LayerInfoConverter() {
             super( LayerInfo.class );
@@ -1866,7 +1937,7 @@ public class XStreamPersister {
     /**
      * Converter for layer groups.
      */
-    class LayerGroupInfoConverter extends AbstractReflectionConverter {
+    class LayerGroupInfoConverter extends AbstractCatalogInfoConverter {
 
         public LayerGroupInfoConverter() {
             super( LayerGroupInfo.class );
@@ -2238,6 +2309,91 @@ public class XStreamPersister {
                 obj.setClientProperties(new HashMap<Object, Object>());
             }
             return obj;
+        }
+    }
+    
+    /**
+     * Converter for all {@link ServiceInfo} resources. Obtains the appropriate service object in 
+     * {@link #instantiateNewInstance(HierarchicalStreamReader, UnmarshallingContext)} prior to 
+     * reading in the XStream request, so that primitive objects are appropriately initialized.
+     * 
+     * Supported implementations of {@link ServiceSettingsResource} must implement 
+     * {@link XStreamPersister.Callback.getServiceObject()} and 
+     * {@link XStreamPersister.Callback.getObjectClass()} when providing an instance of 
+     * {@link XStreamPersister.Callback} to {@link XStreamPersister} in 
+     * {@link ServiceSettingsResource.configurePersister(XStreamPersister, DataFormat)}
+     */
+    public class ServiceInfoConverter extends AbstractReflectionConverter {
+    
+        public ServiceInfoConverter() {
+            super(ServiceInfo.class);
+        }
+        public ServiceInfoConverter(Class<? extends ServiceInfo> clazz) {
+            super(clazz);
+        }
+        
+        public Object doUnmarshal(Object result,
+                HierarchicalStreamReader reader, UnmarshallingContext context) {
+            ServiceInfoImpl obj = (ServiceInfoImpl) super.doUnmarshal(result, reader, context);
+            
+            return obj;
+        }
+        @Override
+        protected Object instantiateNewInstance(HierarchicalStreamReader reader,
+                UnmarshallingContext context) {
+            Object emptyObject = super.instantiateNewInstance(reader, context);
+            //Acquire the current CatalogInfo being acted upon object before unmarshaling the Xstream
+            Object serviceObject = callback.getServiceObject();
+            
+            if (serviceObject != null) {
+                Class i = callback.getObjectClass();
+                
+                if (i != null) {
+                    OwsUtils.copy(serviceObject, emptyObject, i);
+                }
+            }
+            return emptyObject;
+        }
+    }
+    
+    /**
+     * Converts a specific string though encryption and decryption
+     *
+     * @author Andrea Aime - GeoSolutions
+     */
+    class EncryptedFieldConverter extends AbstractSingleValueConverter {
+
+        @Override
+        public boolean canConvert(Class type) {
+            return String.class.equals(type);
+        }
+
+        @Override
+        public Object fromString(String str) {
+            if (str == null) {
+                return null;
+            }
+            if (encryptPasswordFields) {
+                GeoServerSecurityManager secMgr = getSecurityManager();
+                if (secMgr != null) {
+                    return secMgr.getConfigPasswordEncryptionHelper().decode(str);
+                }
+            }
+            return str;
+        }
+
+        @Override
+        public String toString(Object obj) {
+            if (obj == null) {
+                return null;
+            }
+            if (encryptPasswordFields) {
+                GeoServerSecurityManager secMgr = getSecurityManager();
+                if (secMgr != null) {
+                    return secMgr.getConfigPasswordEncryptionHelper().encode((String) obj);
+                }
+            }
+            return obj.toString();
         }
     }
 }

@@ -1,4 +1,4 @@
-/* (c) 2014 Open Source Geospatial Foundation - all rights reserved
+/* (c) 2014 - 2016 Open Source Geospatial Foundation - all rights reserved
  * (c) 2001 - 2013 OpenPlans
  * This code is licensed under the GPL 2.0 license, available at the root
  * application directory.
@@ -9,6 +9,7 @@ import java.util.List;
 
 import org.geoserver.catalog.Catalog;
 import org.geoserver.catalog.CatalogBuilder;
+import org.geoserver.catalog.CatalogInfo;
 import org.geoserver.catalog.CoverageInfo;
 import org.geoserver.catalog.CoverageStoreInfo;
 import org.geoserver.catalog.LayerInfo;
@@ -16,6 +17,7 @@ import org.geoserver.catalog.NamespaceInfo;
 import org.geoserver.config.util.XStreamPersister;
 import org.geoserver.rest.RestletException;
 import org.geoserver.rest.format.DataFormat;
+import org.geoserver.wfs.WFSInfo;
 import org.restlet.Context;
 import org.restlet.data.Request;
 import org.restlet.data.Response;
@@ -76,7 +78,10 @@ public class CoverageResource extends AbstractCatalogResource {
             coverage.setStore( ds );
         }
         final boolean isNew = isNewCoverage(coverage);
-        String name = coverage.getNativeCoverageName();
+        String nativeCoverageName = coverage.getNativeCoverageName();
+        if (nativeCoverageName == null) {
+            nativeCoverageName = coverage.getNativeName();
+        }
         CatalogBuilder builder = new CatalogBuilder(catalog);
         CoverageStoreInfo store = coverage.getStore();
         builder.setStore(store);
@@ -84,10 +89,11 @@ public class CoverageResource extends AbstractCatalogResource {
         // We handle 2 different cases here
         if (!isNew) {
             // Configuring a partially defined coverage
-            builder.initCoverage(coverage, name);
+            builder.initCoverage(coverage, nativeCoverageName);
         } else {
             // Configuring a brand new coverage (only name has been specified)
-            coverage = builder.buildCoverage(name);
+            String specifiedName = coverage.getName();
+            coverage = builder.buildCoverageByName(nativeCoverageName, specifiedName);
         }
 
         NamespaceInfo ns = coverage.getNamespace();
@@ -150,8 +156,9 @@ public class CoverageResource extends AbstractCatalogResource {
         
         CoverageStoreInfo cs = catalog.getCoverageStoreByName(workspace, coveragestore);
         CoverageInfo original = catalog.getCoverageByCoverageStore( cs,  coverage );
-        new CatalogBuilder(catalog).updateCoverage(original,c);
         calculateOptionalFields(c, original);
+        
+        new CatalogBuilder(catalog).updateCoverage(original,c);
         catalog.validate(original, false).throwIfInvalid();
         catalog.save( original );
         
@@ -202,6 +209,25 @@ public class CoverageResource extends AbstractCatalogResource {
     @Override
     protected void configurePersister(XStreamPersister persister, DataFormat format) {
         persister.setCallback( new XStreamPersister.Callback() {
+            @Override
+            protected Class<CoverageInfo> getObjectClass() {
+                return CoverageInfo.class;
+            }
+            @Override
+            protected CatalogInfo getCatalogObject() {
+                String workspace = getAttribute("workspace");
+                String coveragestore = getAttribute("coveragestore");
+                String coverage = getAttribute("coverage");
+                
+                if (workspace == null || coveragestore == null || coverage == null) {
+                    return null;
+                }
+                CoverageStoreInfo cs = catalog.getCoverageStoreByName(workspace, coveragestore);
+                if (cs == null) {
+                    return null;
+                }
+                return catalog.getCoverageByCoverageStore( cs,  coverage );
+            }
             @Override
             protected void postEncodeReference(Object obj, String ref, String prefix, 
                     HierarchicalStreamWriter writer, MarshallingContext context) {

@@ -7,6 +7,7 @@ package org.geoserver.catalog.rest;
 
 import static org.custommonkey.xmlunit.XMLAssert.assertXpathEvaluatesTo;
 import static org.custommonkey.xmlunit.XMLAssert.assertXpathExists;
+import static org.hamcrest.CoreMatchers.containsString;
 import static org.junit.Assert.*;
 
 import java.io.*;
@@ -24,6 +25,7 @@ import org.custommonkey.xmlunit.XpathEngine;
 import org.geoserver.catalog.*;
 import org.geoserver.platform.GeoServerResourceLoader;
 import org.geoserver.data.test.SystemTestData;
+import org.geoserver.data.test.TestData;
 import org.geoserver.platform.resource.Resource;
 import org.geotools.data.DataUtilities;
 import org.geotools.styling.Style;
@@ -73,15 +75,18 @@ public class StyleTest extends CatalogRESTTestSupport {
     @Test
     public void testGetAllAsHTML() throws Exception {
         Document dom = getAsDOM( "/rest/styles.html");
+        print(dom);
         
-        List<StyleInfo> styles = catalog.getStyles();
+        List<StyleInfo> styles = catalog.getStylesByWorkspace(CatalogFacade.NO_WORKSPACE);
         NodeList links = xp.getMatchingNodes("//html:a", dom);
 
         for ( int i = 0; i < styles.size(); i++ ) {
             StyleInfo s = (StyleInfo) styles.get( i );
             Element link = (Element) links.item( i );
             
-            assertTrue( link.getAttribute("href").endsWith( s.getName()+ ".html"));
+            final String href = link.getAttribute("href");
+            assertTrue("Expected href to bed with " + s.getName() + ".html but was " + href,
+                    href.endsWith(s.getName() + ".html"));
         }
     }
 
@@ -224,6 +229,18 @@ public class StyleTest extends CatalogRESTTestSupport {
     }
     
     @Test
+    public void testPostExternalEntityAsSLD() throws Exception {
+        String xml = IOUtils.toString(TestData.class.getResource("externalEntities.sld"), "UTF-8");
+
+        MockHttpServletResponse response = 
+            postAsServletResponse( "/rest/styles", xml, SLDHandler.MIMETYPE_10);
+        assertEquals( 500, response.getStatus() );
+        String message = response.getContentAsString();
+        assertThat(message, containsString("Entity resolution disallowed"));
+        assertThat(message, containsString("/this/file/does/not/exist"));
+    }
+    
+    @Test
     public void testPostAsSLDToWorkspace() throws Exception {
         assertNull( catalog.getStyleByName( "gs", "foo" ) );
         
@@ -300,7 +317,7 @@ public class StyleTest extends CatalogRESTTestSupport {
         Style s = catalog.getStyleByName( "Ponds" ).getStyle();
         ByteArrayOutputStream out = new ByteArrayOutputStream();
 
-        new StyleFormat(SLDHandler.MIMETYPE_10, SLDHandler.VERSION_10, false, new SLDHandler(), null).write(s, out);
+        new StyleFormat(SLDHandler.MIMETYPE_10, SLDHandler.VERSION_10, false, new SLDHandler(), null, getCatalog().getResourcePool().getEntityResolver()).write(s, out);
         
         xml = new String(out.toByteArray());
         assertTrue(xml.contains("<sld:Name>foo</sld:Name>"));
@@ -381,6 +398,17 @@ public class StyleTest extends CatalogRESTTestSupport {
         assertEquals( 403, response.getStatus() );
          
         assertNotNull( catalog.getStyleByName( "Ponds" ) );
+    }
+
+    @Test
+    public void testDeleteWithLayerReferenceAndRecurse() throws Exception {
+        assertNotNull( catalog.getStyleByName( "Ponds" ) );
+
+        MockHttpServletResponse response =
+                deleteAsServletResponse("/rest/styles/Ponds?recurse=true");
+        assertEquals( 200, response.getStatus() );
+
+        assertNull( catalog.getStyleByName( "Ponds" ) );
     }
 
     @Test
@@ -724,6 +752,20 @@ public class StyleTest extends CatalogRESTTestSupport {
         assertEquals("gear.png", onlineResource.getAttribute("xlink:href"));
         assertNotNull(getCatalog().getResourceLoader().find("workspaces/gs/styles/gear.png"));
         assertNotNull(getCatalog().getResourceLoader().find("workspaces/gs/styles/foo.sld"));
+    }
+    
+    @Test
+    public void testPostWithExternalEntities() throws Exception {
+        URL zip = getClass().getResource( "test-data/externalEntities.zip" );
+        byte[] bytes = FileUtils.readFileToByteArray(DataUtilities.urlToFile(zip));
+
+        MockHttpServletResponse response =
+                postAsServletResponse( "/rest/workspaces/gs/styles", bytes, "application/zip");
+        // expecting a failure with explanation
+        assertEquals(400, response.getStatus() );
+        final String content = response.getContentAsString();
+        assertThat(content, containsString("Entity resolution disallowed"));
+        assertThat(content, containsString("/this/file/does/not/exist"));
     }
 
 

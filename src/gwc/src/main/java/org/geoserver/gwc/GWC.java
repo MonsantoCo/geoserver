@@ -16,6 +16,7 @@ import static org.geowebcache.seed.GWCTask.TYPE.TRUNCATE;
 
 import java.io.IOException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -46,6 +47,7 @@ import org.geoserver.catalog.PublishedInfo;
 import org.geoserver.catalog.PublishedType;
 import org.geoserver.catalog.ResourceInfo;
 import org.geoserver.catalog.StyleInfo;
+import org.geoserver.catalog.impl.ProxyUtils;
 import org.geoserver.catalog.util.CloseableIterator;
 import org.geoserver.gwc.config.GWCConfig;
 import org.geoserver.gwc.config.GWCConfigPersister;
@@ -56,9 +58,9 @@ import org.geoserver.gwc.layer.GeoServerTileLayer;
 import org.geoserver.gwc.layer.GeoServerTileLayerInfo;
 import org.geoserver.gwc.layer.GeoServerTileLayerInfoImpl;
 import org.geoserver.ows.Dispatcher;
-import org.geoserver.ows.LocalWorkspace;
 import org.geoserver.ows.Request;
 import org.geoserver.ows.Response;
+import org.geoserver.platform.GeoServerEnvironment;
 import org.geoserver.platform.GeoServerExtensions;
 import org.geoserver.platform.Operation;
 import org.geoserver.security.AccessLimits;
@@ -67,6 +69,7 @@ import org.geoserver.security.DataAccessLimits;
 import org.geoserver.security.WMSAccessLimits;
 import org.geoserver.security.WrapperPolicy;
 import org.geoserver.security.decorators.SecuredLayerInfo;
+import org.geoserver.wfs.kvp.BBoxKvpParser;
 import org.geoserver.wms.GetMapRequest;
 import org.geoserver.wms.WMS;
 import org.geoserver.wms.map.RenderedImageMap;
@@ -79,6 +82,7 @@ import org.geotools.ows.ServiceException;
 import org.geotools.referencing.CRS;
 import org.geotools.referencing.CRS.AxisOrder;
 import org.geotools.util.logging.Logging;
+import org.geowebcache.GeoWebCacheEnvironment;
 import org.geowebcache.GeoWebCacheException;
 import org.geowebcache.GeoWebCacheExtensions;
 import org.geowebcache.config.BlobStoreConfig;
@@ -216,6 +220,12 @@ public class GWC implements DisposableBean, InitializingBean, ApplicationContext
     
     private FilterFactory2 ff = CommonFactoryFinder.getFilterFactory2();
     
+    private GeoWebCacheEnvironment gwcEnvironment;
+    
+    final GeoServerEnvironment gsEnvironment = GeoServerExtensions.bean(GeoServerEnvironment.class);
+
+    // list of GeoServer contributed grid sets that should not be editable by the user
+    private final Set<String> geoserverEmbeddedGridSets = new HashSet<>();
     
     public GWC(final GWCConfigPersister gwcConfigPersister, final StorageBroker sb,
             final TileLayerDispatcher tld, final GridSetBroker gridSetBroker,
@@ -279,6 +289,7 @@ public class GWC implements DisposableBean, InitializingBean, ApplicationContext
                         + " found by GeoServerExtensions");
             }
         }
+        GWC.INSTANCE.syncEnv();
         return GWC.INSTANCE;
     }
 
@@ -670,6 +681,29 @@ public class GWC implements DisposableBean, InitializingBean, ApplicationContext
         if (!tileLayer.isEnabled()) {
             requestMistmatchTarget.append("tile layer disabled");
             return null;
+        }
+
+        if (getConfig().isSecurityEnabled()) {
+            String bboxstr = request.getRawKvp().get("BBOX");
+            String srs = request.getRawKvp().get("SRS");
+            ReferencedEnvelope bbox = null;
+            try {
+                bbox = (ReferencedEnvelope) new BBoxKvpParser().parse(bboxstr);
+            } catch (Exception e) {
+                throw new RuntimeException("Invalid bbox for layer '" + layerName + "': " + bboxstr);
+            }
+            if (srs != null) {
+                try {
+                    bbox = new ReferencedEnvelope(bbox, CRS.decode(srs));
+                } catch (Exception e) {
+                    throw new RuntimeException("Can't decode SRS for layer '" + layerName + "': " + srs);
+                }
+            }
+            try {
+                verifyAccessLayer(layerName, bbox);
+            } catch (ServiceException e) {
+                return null;
+            }
         }
 
         ConveyorTile tileReq = prepareRequest(tileLayer, request, requestMistmatchTarget);
@@ -1852,12 +1886,18 @@ public class GWC implements DisposableBean, InitializingBean, ApplicationContext
     }
 
     /**
+     * Add the provided grid set id to the list of GeoServer grid sets that cannot be edited by the user.
+     */
+    public void addEmbeddedGridSet(String gridSetId) {
+        geoserverEmbeddedGridSets.add(gridSetId);
+    }
+
+    /**
      * @return {@code true} if the GridSet named {@code gridSetId} is a GWC internally defined one,
      *         {@code false} otherwise
      */
     public boolean isInternalGridSet(final String gridSetId) {
-        boolean internal = gridSetBroker.getEmbeddedNames().contains(gridSetId);
-        return internal;
+        return gridSetBroker.getEmbeddedNames().contains(gridSetId) || geoserverEmbeddedGridSets.contains(gridSetId);
     }
 
     /**
@@ -2079,6 +2119,11 @@ public class GWC implements DisposableBean, InitializingBean, ApplicationContext
         }
         if (boundingBox != null) {
             for (LayerInfo layerInfo : layerInfos) {
+                // Unwrap potential proxy instances, so the instanceof SecuredLayerInfo check works.
+                if(layerInfo instanceof Proxy) {
+                    layerInfo = ProxyUtils.unwrap(layerInfo, Proxy.getInvocationHandler(layerInfo).getClass());
+                }
+
                 if(layerInfo instanceof SecuredLayerInfo) {
                     // test layer bbox limits
                     SecuredLayerInfo securedLayerInfo = (SecuredLayerInfo) layerInfo;
@@ -2202,6 +2247,28 @@ public class GWC implements DisposableBean, InitializingBean, ApplicationContext
     @Override
     public void setApplicationContext(ApplicationContext applicationContext) throws BeansException {
         this.applicationContext = applicationContext;
+        
+        this.gwcEnvironment = GeoServerExtensions.bean(GeoWebCacheEnvironment.class);
+        
+        syncEnv();
+    }
+
+    /**
+     * @throws IllegalArgumentException
+     */
+    public void syncEnv() throws IllegalArgumentException {
+        if (gsEnvironment != null && gsEnvironment.isStale() && gwcEnvironment != null) {
+            if (GeoServerEnvironment.ALLOW_ENV_PARAMETRIZATION && gsEnvironment.getProps() != null) {
+                Properties gwcProps = gwcEnvironment.getProps();
+
+                if (gwcProps == null) {
+                    gwcProps = new Properties();
+                }
+                gwcProps.putAll(gsEnvironment.getProps());
+
+                gwcEnvironment.setProps(gwcProps);
+            }
+        }
     }
     
     /**
@@ -2414,5 +2481,12 @@ public class GWC implements DisposableBean, InitializingBean, ApplicationContext
         checkNotNull(compositeBlobStore);
         return compositeBlobStore;
     }
-    
+
+    /**
+     * @return the gwcEnvironment
+     */
+    public GeoWebCacheEnvironment getGwcEnvironment() {
+        return gwcEnvironment;
+    }
+
 }

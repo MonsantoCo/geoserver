@@ -5,16 +5,20 @@
  */
 package org.geoserver.catalog.rest;
 
-import java.io.*;
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FilenameFilter;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 
-import com.google.common.io.Files;
-
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.FilenameUtils;
+import org.geoserver.catalog.CascadeDeleteVisitor;
 import org.geoserver.catalog.Catalog;
 import org.geoserver.catalog.CatalogBuilder;
 import org.geoserver.catalog.LayerInfo;
@@ -33,11 +37,14 @@ import org.geotools.styling.Style;
 import org.geotools.util.Converters;
 import org.geotools.util.Version;
 import org.restlet.Context;
-import org.restlet.data.MediaType;
 import org.restlet.data.Form;
+import org.restlet.data.MediaType;
 import org.restlet.data.Request;
 import org.restlet.data.Response;
 import org.restlet.data.Status;
+import org.xml.sax.EntityResolver;
+
+import com.google.common.io.Files;
 
 public class StyleResource extends AbstractCatalogResource {
 
@@ -57,9 +64,10 @@ public class StyleResource extends AbstractCatalogResource {
     protected List<DataFormat> createSupportedFormats(Request request,Response response) {
         List<DataFormat> formats =  super.createSupportedFormats(request,response);
         boolean prettyPrint = isPrettyPrint(request);
+        EntityResolver entityResolver = catalog.getResourcePool().getEntityResolver();
         for (StyleHandler sh : Styles.handlers()) {
             for (Version ver : sh.getVersions()) {
-                formats.add(new StyleFormat(sh.mimeType(ver), ver, prettyPrint, sh, request));
+                formats.add(new StyleFormat(sh.mimeType(ver), ver, prettyPrint, sh, request, entityResolver));
             }
         }
 
@@ -374,26 +382,29 @@ public class StyleResource extends AbstractCatalogResource {
     @Override
     protected void handleObjectDelete() throws Exception {
         String workspace = getAttribute("workspace");
-        String style = getAttribute("style");
-        StyleInfo s = workspace != null ? catalog.getStyleByName(workspace, style) :
-            catalog.getStyleByName(style);
-        
-        //ensure that no layers reference the style
-        List<LayerInfo> layers = catalog.getLayers(s);
-        if ( !layers.isEmpty() ) {
-            throw new RestletException( "Can't delete style referenced by existing layers.", Status.CLIENT_ERROR_FORBIDDEN );
+        String styleName = getAttribute("style");
+        boolean recurse = getQueryStringValue("recurse", Boolean.class, false);
+
+        StyleInfo style = workspace != null ? catalog.getStyleByName(workspace, styleName) :
+            catalog.getStyleByName(styleName);
+
+        if (recurse) {
+            new CascadeDeleteVisitor(catalog).visit(style);
+        } else {
+            // ensure that no layers reference the style
+            List<LayerInfo> layers = catalog.getLayers(style);
+            if (!layers.isEmpty()) {
+                throw new RestletException("Can't delete style referenced by existing layers.", Status.CLIENT_ERROR_FORBIDDEN);
+            }
+            catalog.remove(style);
         }
-        
-        catalog.remove( s );
-        
-        //check purge parameter to determine if the underlying file 
+
+        // check purge parameter to determine if the underlying file
         // should be deleted
-        String p = getRequest().getResourceRef().getQueryAsForm().getFirstValue("purge"); 
-        boolean purge = (p != null) ? Boolean.parseBoolean(p) : false;
-        catalog.getResourcePool().deleteStyle(s, purge);
-        
-        LOGGER.info( "DELETE style " + style);
-       
+        boolean purge = getQueryStringValue("purge", Boolean.class, false);
+        catalog.getResourcePool().deleteStyle(style, purge);
+
+        LOGGER.info("DELETE style " + styleName);
     }
 
 
@@ -404,7 +415,7 @@ public class StyleResource extends AbstractCatalogResource {
     private File unzipSldPackage(InputStream object) throws IOException {
         File tempDir = Files.createTempDir();
 
-        org.geoserver.data.util.IOUtils.decompress(object, tempDir);
+        org.geoserver.util.IOUtils.decompress(object, tempDir);
 
         return tempDir;
     }
@@ -480,6 +491,10 @@ public class StyleResource extends AbstractCatalogResource {
 
             SLDParser parser
                     = new SLDParser(CommonFactoryFinder.getStyleFactory(null), is);
+            EntityResolver resolver = catalog.getResourcePool().getEntityResolver();
+            if(resolver != null) {
+                parser.setEntityResolver(resolver);
+            }
 
             Style[] styles = parser.readXML();
             if (styles.length > 0) {
@@ -494,7 +509,7 @@ public class StyleResource extends AbstractCatalogResource {
 
         } catch (Exception ex) {
             LOGGER.severe(ex.getMessage());
-            throw new RestletException("Style error.", Status.CLIENT_ERROR_BAD_REQUEST);
+            throw new RestletException("Style error. " + ex.getMessage(), Status.CLIENT_ERROR_BAD_REQUEST);
 
         } finally {
             IOUtils.closeQuietly(is);

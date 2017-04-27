@@ -1,4 +1,4 @@
-/* (c) 2014 Open Source Geospatial Foundation - all rights reserved
+/* (c) 2014 - 2016 Open Source Geospatial Foundation - all rights reserved
  * (c) 2001 - 2013 OpenPlans
  * This code is licensed under the GPL 2.0 license, available at the root
  * application directory.
@@ -16,6 +16,7 @@ import org.eclipse.emf.ecore.EObject;
 import org.geoserver.catalog.Catalog;
 import org.geoserver.catalog.LayerInfo;
 import org.geoserver.catalog.NamespaceInfo;
+import org.geoserver.catalog.PublishedInfo;
 import org.geoserver.catalog.WorkspaceInfo;
 import org.geoserver.ows.Request;
 import org.geoserver.ows.WorkspaceQualifyingCallback;
@@ -42,7 +43,7 @@ public class WFSWorkspaceQualifier extends WorkspaceQualifyingCallback {
     }
 
     @Override
-    protected void qualifyRequest(WorkspaceInfo workspace, LayerInfo layer, Service service, Request request) {
+    protected void qualifyRequest(WorkspaceInfo workspace, PublishedInfo layer, Service service, Request request) {
         if (request.getContext() != null) {
             // if a qualifying workspace exist, try to qualify the request typename
             // parameter, if present
@@ -61,11 +62,11 @@ public class WFSWorkspaceQualifier extends WorkspaceQualifyingCallback {
                                 typeName = new QName(ns.getURI(),
                                         typeName.getLocalPart());
                             } else if (typeName.getNamespaceURI().equals(
-                                    catalog.getDefaultNamespace().getURI())) {
+                                    catalog.getDefaultNamespace().getURI()) || !typeName.getNamespaceURI().equals(ns.getURI())) {
                                 // more complex case, if we have the default
                                 // namespace, we have to check if it's been
                                 // specified on the request, or assigned by parser
-                                typeName = checkDefaultNamespace(request, ns,
+                                typeName = checkOriginallyUnqualified(request, ns,
                                         typeName);
                             }
                             qualifiedNames.add(typeName);
@@ -89,7 +90,7 @@ public class WFSWorkspaceQualifier extends WorkspaceQualifyingCallback {
      * @param typeName
      *
      */
-    private QName checkDefaultNamespace(Request request, NamespaceInfo ns,
+    private QName checkOriginallyUnqualified(Request request, NamespaceInfo ns,
             QName typeName) {
         Map<String, String[]> originalParams = request
                 .getHttpRequest().getParameterMap();
@@ -111,7 +112,7 @@ public class WFSWorkspaceQualifier extends WorkspaceQualifyingCallback {
     }
     
     @Override
-    protected void qualifyRequest(WorkspaceInfo workspace, LayerInfo layer, Operation operation, Request request) {
+    protected void qualifyRequest(WorkspaceInfo workspace, PublishedInfo layer, Operation operation, Request request) {
         NamespaceInfo ns = catalog.getNamespaceByPrefix(workspace.getName());
         
         GetCapabilitiesRequest caps = GetCapabilitiesRequest.adapt(

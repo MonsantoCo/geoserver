@@ -1,4 +1,4 @@
-/* (c) 2014 - 2015 Open Source Geospatial Foundation - all rights reserved
+/* (c) 2014 - 2016 Open Source Geospatial Foundation - all rights reserved
  * (c) 2001 - 2013 OpenPlans
  * This code is licensed under the GPL 2.0 license, available at the root
  * application directory.
@@ -22,7 +22,7 @@ import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import org.geoserver.ows.LocalLayer;
+import org.geoserver.ows.LocalPublished;
 import org.geoserver.ows.LocalWorkspace;
 import org.geoserver.ows.URLMangler.URLType;
 import org.geoserver.ows.util.ResponseUtils;
@@ -39,9 +39,14 @@ import org.geotools.map.Layer;
 import org.geotools.map.WMSLayer;
 import org.geotools.referencing.CRS;
 import org.geotools.referencing.CRS.AxisOrder;
+import org.geotools.renderer.crs.ProjectionHandler;
+import org.geotools.renderer.crs.ProjectionHandlerFinder;
+import org.geotools.renderer.crs.WrappingProjectionHandler;
 import org.geotools.util.Converters;
 import org.geotools.util.logging.Logging;
 import org.opengis.feature.type.FeatureType;
+import org.opengis.geometry.MismatchedDimensionException;
+import org.opengis.referencing.FactoryException;
 import org.opengis.referencing.crs.CoordinateReferenceSystem;
 import org.opengis.referencing.crs.ProjectedCRS;
 
@@ -164,6 +169,18 @@ public class OpenLayersMapOutputFormat implements GetMapOutputFormat {
             map.put("request", request);
             map.put("yx", String.valueOf(isWms13FlippedCRS(request.getCrs())));
             map.put("maxResolution", new Double(getMaxResolution(mapContent.getRenderingArea())));
+            ProjectionHandler handler = null;
+            try {
+                handler = ProjectionHandlerFinder.getHandler(
+                        new ReferencedEnvelope(request.getCrs()), 
+                        request.getCrs(), wms.isContinuousMapWrappingEnabled());
+            } catch (MismatchedDimensionException e) {
+                LOGGER.log(Level.FINER, e.getMessage(), e);
+            } catch (FactoryException e) {
+                LOGGER.log(Level.FINER, e.getMessage(), e);
+            }
+            map.put("global", String.valueOf(
+                    handler != null && handler instanceof WrappingProjectionHandler));
 
             String baseUrl = ResponseUtils.buildURL(request.getBaseUrl(), "/", null, URLType.RESOURCE);
             String queryString = null;
@@ -178,8 +195,8 @@ public class OpenLayersMapOutputFormat implements GetMapOutputFormat {
             // TODO: replace service path with call to buildURL since it does this
             // same dance
             String servicePath = "wms";
-            if (LocalLayer.get() != null) {
-                servicePath = LocalLayer.get().getName() + "/" + servicePath;
+            if (LocalPublished.get() != null) {
+                servicePath = LocalPublished.get().getName() + "/" + servicePath;
             }
             if (LocalWorkspace.get() != null) {
                 servicePath = LocalWorkspace.get().getName() + "/" + servicePath;

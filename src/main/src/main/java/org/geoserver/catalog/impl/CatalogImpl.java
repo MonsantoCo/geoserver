@@ -14,6 +14,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.Stack;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
@@ -91,7 +92,7 @@ public class CatalogImpl implements Catalog {
     /**
      * listeners
      */
-    protected List listeners = new ArrayList();
+    protected List listeners = new CopyOnWriteArrayList<>();
 
     /** 
      * resources
@@ -651,19 +652,17 @@ public class CatalogImpl implements Catalog {
         // calling LayerInfo.setName(String) updates the resource (until the layer/publishing split
         // is in act), but that doesn't mean the resource was saved previously, which can leave the
         // catalog in an inconsistent state
-        if (null == getResourceByName(layer.getResource().getNamespace(), layer.getResource()
+        final NamespaceInfo ns = layer.getResource().getNamespace();
+        if (null == getResourceByName(ns, layer.getResource()
                 .getName(), ResourceInfo.class)) {
             throw new IllegalStateException("Found no resource named " + layer.prefixedName()
                     + " , Layer with that name can't be added");
         }
-        LayerInfo existing = getLayerByName( layer.getName() );
+        final String prefix = ns != null ? ns.getPrefix() : null;
+        LayerInfo existing = getLayerByName(prefix, layer.getName() );
         if ( existing != null && !existing.getId().equals( layer.getId() ) ) {
-            //JD: since layers are not qualified by anything (yet), check 
-            // namespace of the resource, if they are different then allow the 
-            // layer to be added
-            if ( existing.getResource().getNamespace().equals( layer.getResource().getNamespace() ) ) {
-                throw new IllegalArgumentException( "Layer named '"+layer.getName()+"' already exists.");
-            }
+            throw new IllegalArgumentException(
+                    "Layer named '" + layer.getName() + "' in workspace '" + prefix + "' already exists.");
         }
         
         // if the style is missing associate a default one, to avoid breaking WMS
@@ -930,6 +929,14 @@ public class CatalogImpl implements Catalog {
     }
     
     public void remove(LayerGroupInfo layerGroup) {
+        //ensure no references to the layer group
+        for ( LayerGroupInfo lg : facade.getLayerGroups() ) {
+            if ( lg.getLayers().contains( layerGroup ) || layerGroup.equals( lg.getRootLayer() ) ) {
+                String msg = "Unable to delete layer group referenced by layer group '"+lg.getName()+"'";
+                throw new IllegalArgumentException( msg );
+            }
+        }
+
         facade.remove(layerGroup);
         removed( layerGroup );
     }
@@ -1063,9 +1070,10 @@ public class CatalogImpl implements Catalog {
         
         NamespaceInfo added;
         synchronized (facade) {
-            added = facade.add(resolve(namespace));
+            final NamespaceInfo resolved = resolve(namespace);
+            added = facade.add(resolved);
             if ( getDefaultNamespace() == null ) {
-                setDefaultNamespace(namespace);
+                setDefaultNamespace(resolved);
             }
         }
         
@@ -1154,6 +1162,8 @@ public class CatalogImpl implements Catalog {
             NamespaceInfo ns = getNamespaceByPrefix( defaultNamespace.getPrefix() );
             if ( ns == null ) {
                 throw new IllegalArgumentException( "No such namespace: '" + defaultNamespace.getPrefix() + "'" );
+            } else {
+                defaultNamespace = ns;
             }
         }
         facade.setDefaultNamespace(defaultNamespace);
@@ -1247,11 +1257,16 @@ public class CatalogImpl implements Catalog {
         return facade.getDefaultWorkspace();
     }
     
-    public void setDefaultWorkspace(WorkspaceInfo workspace) {
-        if (workspace != null && facade.getWorkspaceByName(workspace.getName()) == null) {
-            facade.add(workspace);
+    public void setDefaultWorkspace(WorkspaceInfo defaultWorkspace) {
+        if (defaultWorkspace != null) {
+            WorkspaceInfo ws = facade.getWorkspaceByName(defaultWorkspace.getName());
+            if ( ws == null ) {
+                throw new IllegalArgumentException( "No such workspace: '" + defaultWorkspace.getName() + "'" );
+            } else {
+                defaultWorkspace = ws;
+            }
         }
-        facade.setDefaultWorkspace(workspace);
+        facade.setDefaultWorkspace(defaultWorkspace);
     }
     
     public List<WorkspaceInfo> getWorkspaces() {
@@ -1373,10 +1388,8 @@ public class CatalogImpl implements Catalog {
     
     public void remove(StyleInfo style) {
         //ensure no references to the style
-        for ( LayerInfo l : facade.getLayers() ) {
-            if ( style.equals( l.getDefaultStyle() ) || l.getStyles().contains( style )) {
-                throw new IllegalArgumentException( "Unable to delete style referenced by '"+ l.getName()+"'");
-            }
+        for ( LayerInfo l : facade.getLayers(style) ) {
+            throw new IllegalArgumentException( "Unable to delete style referenced by '"+ l.getName()+"'");
         }
 
         for ( LayerGroupInfo lg : facade.getLayerGroups() ) {
@@ -1415,12 +1428,7 @@ public class CatalogImpl implements Catalog {
     
     @Override
     public void removeListeners(Class listenerClass) {
-        for (Iterator it = listeners.iterator(); it.hasNext();) {
-            CatalogListener listener = (CatalogListener) it.next();
-            if(listenerClass.isInstance(listener)) {
-                it.remove();
-            }
-        }
+        new ArrayList<>(listeners).stream().filter(l -> listenerClass.isInstance(l)).forEach(l -> listeners.remove(l));
     }
 
     public Iterator search(String cql) {
@@ -1506,8 +1514,7 @@ public class CatalogImpl implements Catalog {
             } catch(Throwable t) {
                 if ( t instanceof CatalogException && toThrow == null) {
                     toThrow = (CatalogException) t;
-                }
-                else {
+                } else if(LOGGER.isLoggable(Level.WARNING)) {
                     LOGGER.log(Level.WARNING, "Catalog listener threw exception handling event.", t);
                 }
             }
